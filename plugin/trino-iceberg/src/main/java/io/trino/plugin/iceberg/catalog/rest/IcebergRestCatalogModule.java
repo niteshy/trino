@@ -16,13 +16,18 @@ package io.trino.plugin.iceberg.catalog.rest;
 import com.google.inject.Binder;
 import com.google.inject.Scopes;
 import io.airlift.configuration.AbstractConfigurationAwareModule;
+import io.trino.filesystem.manager.FileSystemConfig;
 import io.trino.plugin.iceberg.IcebergConfig;
 import io.trino.plugin.iceberg.IcebergFileSystemFactory;
 import io.trino.plugin.iceberg.catalog.TrinoCatalogFactory;
 import io.trino.spi.TrinoException;
 
+import java.net.URI;
+import java.util.Optional;
+
 import static com.google.inject.multibindings.OptionalBinder.newOptionalBinder;
 import static io.airlift.configuration.ConfigBinder.configBinder;
+import static io.trino.spi.StandardErrorCode.CONFIGURATION_INVALID;
 import static io.trino.spi.StandardErrorCode.NOT_SUPPORTED;
 
 public class IcebergRestCatalogModule
@@ -47,6 +52,66 @@ public class IcebergRestCatalogModule
         IcebergRestCatalogConfig restCatalogConfig = buildConfigObject(IcebergRestCatalogConfig.class);
         if (restCatalogConfig.isVendedCredentialsEnabled() && icebergConfig.isRegisterTableProcedureEnabled()) {
             throw new TrinoException(NOT_SUPPORTED, "Using the `register_table` procedure with vended credentials is currently not supported");
+        }
+        if (restCatalogConfig.isVendedCredentialsEnabled()) {
+            validateVendedCredentialsNativeFilesystem(restCatalogConfig, buildConfigObject(FileSystemConfig.class));
+        }
+    }
+
+    private static void validateVendedCredentialsNativeFilesystem(IcebergRestCatalogConfig restCatalogConfig, FileSystemConfig fileSystemConfig)
+    {
+        Optional<String> warehouseScheme = restCatalogConfig.getWarehouse().flatMap(IcebergRestCatalogModule::parseWarehouseScheme);
+        if (warehouseScheme.isPresent()) {
+            validateNativeFilesystemForScheme(warehouseScheme.orElseThrow(), fileSystemConfig);
+            return;
+        }
+        if (!fileSystemConfig.isS3Enabled() && !fileSystemConfig.isGcsEnabled() && !fileSystemConfig.isAzureEnabled()) {
+            throw new TrinoException(
+                    CONFIGURATION_INVALID,
+                    "Vended credentials require a native cloud filesystem to be enabled (set fs.s3.enabled, fs.gcs.enabled, or fs.azure.enabled to true, or disable iceberg.rest-catalog.vended-credentials-enabled)");
+        }
+    }
+
+    private static Optional<String> parseWarehouseScheme(String warehouse)
+    {
+        if (!warehouse.contains("://")) {
+            return Optional.empty();
+        }
+        try {
+            return Optional.of(URI.create(warehouse).getScheme());
+        }
+        catch (IllegalArgumentException _) {
+            return Optional.empty();
+        }
+    }
+
+    private static void validateNativeFilesystemForScheme(String scheme, FileSystemConfig fileSystemConfig)
+    {
+        switch (scheme) {
+            case "s3", "s3a", "s3n" -> {
+                if (!fileSystemConfig.isS3Enabled()) {
+                    throw new TrinoException(
+                            CONFIGURATION_INVALID,
+                            "Vended credentials require fs.s3.enabled=true when warehouse location uses the s3 scheme (or disable iceberg.rest-catalog.vended-credentials-enabled)");
+                }
+            }
+            case "gs" -> {
+                if (!fileSystemConfig.isGcsEnabled()) {
+                    throw new TrinoException(
+                            CONFIGURATION_INVALID,
+                            "Vended credentials require fs.gcs.enabled=true when warehouse location uses the gs scheme (or disable iceberg.rest-catalog.vended-credentials-enabled)");
+                }
+            }
+            case "abfs", "abfss", "wasb", "wasbs" -> {
+                if (!fileSystemConfig.isAzureEnabled()) {
+                    throw new TrinoException(
+                            CONFIGURATION_INVALID,
+                            "Vended credentials require fs.azure.enabled=true when warehouse location uses the %s scheme (or disable iceberg.rest-catalog.vended-credentials-enabled)".formatted(scheme));
+                }
+            }
+            default -> throw new TrinoException(
+                    CONFIGURATION_INVALID,
+                    "Vended credentials do not support warehouse locations with the %s scheme".formatted(scheme));
         }
     }
 }
